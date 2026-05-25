@@ -19,6 +19,9 @@ dependencies = [
     "biopython>=1.79",
 ]
 
+[project.optional-dependencies]
+progress = ["tqdm"]
+
 [project.urls]
 Homepage = "https://github.com/emarquezz/KEGGtangled"
 Repository = "https://github.com/emarquezz/KEGGtangled"
