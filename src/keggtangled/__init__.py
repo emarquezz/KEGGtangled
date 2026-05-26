@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 import re
 import os
@@ -138,15 +138,19 @@ class Reaction:
 
 
 # ----------------------------------------------------------------------
-# Pathway class (optimized with __slots__, gene_ids is a frozenset)
+# Pathway class (optimized with __slots__, now includes metadata fields)
 # ----------------------------------------------------------------------
 class Pathway:
     """Represents a KEGG pathway with immutable gene_ids and reaction_ids."""
 
-    __slots__ = ('id', 'gene_ids', 'reaction_ids')
+    __slots__ = ('id', 'title', 'description', 'dblinks',
+                 'gene_ids', 'reaction_ids')
 
     def __init__(self, pathway_id: str, gene_kos: Optional[Dict[str, Set[str]]] = None) -> None:
         self.id: str = pathway_id
+        self.title: Optional[str] = None
+        self.description: Optional[str] = None   # <-- new
+        self.dblinks: Dict[str, str] = {}        # <-- new, e.g., {"GO": "0006096"}
         if gene_kos is None:
             gene_kos = {}
         self.gene_ids: FrozenSet[str] = frozenset(gene_kos.keys())
@@ -487,7 +491,7 @@ class Organism:
         return frozenset()
 
     # ------------------------------------------------------------------
-    # Pathway loading
+    # Pathway loading (now parses description, dblinks, and title fallback)
     # ------------------------------------------------------------------
     def _parse_gene_kos_from_text(self, flat_text: str) -> Dict[str, Set[str]]:
         gene_kos = {}
@@ -534,6 +538,53 @@ class Organism:
         pw = Pathway(pathway_id, gene_kos)
         self.pathways[pathway_id] = pw
 
+        # ---------- Parse additional metadata from flat text ----------
+        in_desc = False
+        in_dblinks = False
+        desc_lines = []
+        for line in flat_text.splitlines():
+            # Title from NAME (fallback if KGML title is missing)
+            if line.startswith("NAME") and pw.title is None:
+                title = line[5:].strip()  # remove "NAME" and leading spaces
+                pw.title = title
+            # DESCRIPTION (multi‑line)
+            if line.startswith("DESCRIPTION"):
+                in_desc = True
+                # The first line may contain text after "DESCRIPTION"
+                rest = line[12:].strip()  # len("DESCRIPTION ") = 12
+                if rest:
+                    desc_lines.append(rest)
+                continue
+            if in_desc:
+                if line.startswith(" "):
+                    desc_lines.append(line.strip())
+                else:
+                    in_desc = False
+            # DBLINKS (multi‑line)
+            if line.startswith("DBLINKS"):
+                in_dblinks = True
+                rest = line[8:].strip()   # len("DBLINKS ") = 8
+                if rest:
+                    # e.g. "GO: 0006096"
+                    db_parts = rest.split(": ", 1)
+                    if len(db_parts) == 2:
+                        pw.dblinks[db_parts[0]] = db_parts[1]
+                    else:
+                        logger.debug(f"Could not parse DBLINKS entry: {rest}")
+                continue
+            if in_dblinks:
+                if line.startswith(" "):
+                    rest = line.strip()
+                    db_parts = rest.split(": ", 1)
+                    if len(db_parts) == 2:
+                        pw.dblinks[db_parts[0]] = db_parts[1]
+                else:
+                    in_dblinks = False
+
+        if desc_lines:
+            pw.description = " ".join(desc_lines)
+        # ----------------------------------------------------------------
+
         self._parse_compound_names_from_text(flat_text)
 
         all_kos = set().union(*gene_kos.values()) if gene_kos else set()
@@ -551,6 +602,9 @@ class Organism:
             kgml = None
 
         if kgml is not None:
+            # KGML title takes precedence over the NAME line
+            pw.title = kgml.title
+
             for kgml_rxn in kgml.reactions:
                 rxn_id = kgml_rxn.name.split(':')[-1]
 
