@@ -1,6 +1,19 @@
 #!/usr/bin/env python
 # coding: utf-8
-__version__ = "0.5.0"
+"""
+keggtangled v0.6.0 – Fully linked KEGG metabolism library.
+
+Now every object "knows" about its neighbours:
+- Compound ↔ reactions, pathways, genes
+- Reaction ↔ compounds, pathways, genes
+- Pathway ↔ compounds, reactions, genes
+- Gene ↔ reactions, pathways, compounds (via Organism)
+
+All relationships are stored as frozensets of string IDs,
+ensuring easy serialisation and no circular pickling issues.
+"""
+
+__version__ = "0.6.0"
 
 import re
 import os
@@ -52,54 +65,76 @@ logger.setLevel(logging.INFO)
 KO_RE = re.compile(r'\[KO:(K\d+)\]')
 
 # ----------------------------------------------------------------------
-# Compound
+# Compound (now fully linked)
 # ----------------------------------------------------------------------
 class Compound:
-    __slots__ = ('id', 'organism', 'name', 'formula', 'mass', 'reactions',
-                 '_kos', '_genes')
+    __slots__ = ('id', 'organism', 'name', 'formula', 'mass', 'bigg_id',
+                 '_reaction_ids', '_pathway_ids', '_gene_ids')
 
     def __init__(self, compound_id: str, organism: 'Organism') -> None:
-        self.id = compound_id
+        self.id = compound_id                # bare ID, e.g. 'C00011'
         self.organism = organism
         self.name: Optional[str] = None
         self.formula: Optional[str] = None
         self.mass: Optional[str] = None
-        self.reactions: Union[Set[str], FrozenSet[str]] = set()
-        self._kos: Optional[FrozenSet[str]] = None
-        self._genes: Optional[FrozenSet[str]] = None
+        self.bigg_id: Optional[str] = None   # user can fill this in later
+        self._reaction_ids: Optional[FrozenSet[str]] = None
+        self._pathway_ids: Optional[FrozenSet[str]] = None
+        self._gene_ids: Optional[FrozenSet[str]] = None
 
     def __repr__(self) -> str:
         return f"Compound({self.id}, {self.name})"
 
-    def get_kos(self) -> FrozenSet[str]:
-        if self._kos is None:
-            kos = set()
-            for rxn_id in self.reactions:
-                kos.update(self.organism._reaction_to_kos.get(rxn_id, frozenset()))
-            self._kos = frozenset(kos)
-        return self._kos
+    @property
+    def reactions(self) -> FrozenSet[str]:
+        """Reaction IDs that involve this compound."""
+        if self._reaction_ids is None:
+            # Should be filled during Organism.finalize()
+            return frozenset()
+        return self._reaction_ids
 
-    def get_genes(self) -> FrozenSet[str]:
-        if self._genes is None:
-            genes = set()
-            for ko in self.get_kos():
-                genes.update(self.organism.get_genes_for_ko(ko))
-            self._genes = frozenset(genes)
-        return self._genes
+    @property
+    def pathways(self) -> FrozenSet[str]:
+        """Pathway IDs that contain this compound (via reactions)."""
+        if self._pathway_ids is None:
+            return frozenset()
+        return self._pathway_ids
+
+    @property
+    def genes(self) -> FrozenSet[str]:
+        """Gene IDs associated with reactions involving this compound."""
+        if self._gene_ids is None:
+            return frozenset()
+        return self._gene_ids
+
+    # Legacy methods for compatibility (still useful for direct lookups)
+    def get_kos(self) -> FrozenSet[str]:
+        kos = set()
+        for rxn_id in self.reactions:
+            kos.update(self.organism._reaction_to_kos.get(rxn_id, frozenset()))
+        return frozenset(kos)
+
+    def get_genes(self) -> FrozenSet[str]:   # kept as method to not conflict with property 'genes'
+        return self.genes                    # now identical to property
 
 
 # ----------------------------------------------------------------------
-# Reaction
+# Reaction (now holds substrate/product IDs, pathways, etc.)
 # ----------------------------------------------------------------------
 class Reaction:
     __slots__ = ('reaction_id', 'organism', 'ko_to_genes',
-                 'formula_per_pathway', '_kos_cache', '_genes_cache')
+                 'formula_per_pathway',
+                 '_substrate_ids', '_product_ids', '_pathway_ids',
+                 '_kos_cache', '_genes_cache')
 
     def __init__(self, reaction_id: str, organism: 'Organism') -> None:
         self.reaction_id = reaction_id
         self.organism = organism
         self.ko_to_genes: Dict[str, Set[str]] = {}
         self.formula_per_pathway: Dict[str, dict] = {}
+        self._substrate_ids: Set[str] = set()     # bare compound IDs
+        self._product_ids: Set[str] = set()
+        self._pathway_ids: Optional[FrozenSet[str]] = None
         self._kos_cache: Optional[Tuple[str, ...]] = None
         self._genes_cache: Optional[FrozenSet[str]] = None
 
@@ -114,6 +149,28 @@ class Reaction:
                 f"{len(self.ko_to_genes)} KOs mapped to genes, "
                 f"{len(self.formula_per_pathway)} pathway formulas")
 
+    @property
+    def substrates(self) -> FrozenSet[str]:
+        """Bare compound IDs of substrates."""
+        return frozenset(self._substrate_ids)
+
+    @property
+    def products(self) -> FrozenSet[str]:
+        """Bare compound IDs of products."""
+        return frozenset(self._product_ids)
+
+    @property
+    def compounds(self) -> FrozenSet[str]:
+        """All compound IDs (substrates + products)."""
+        return self.substrates | self.products
+
+    @property
+    def pathways(self) -> FrozenSet[str]:
+        """Pathway IDs this reaction belongs to."""
+        if self._pathway_ids is None:
+            return frozenset()
+        return self._pathway_ids
+
     def get_genes(self) -> FrozenSet[str]:
         if self._genes_cache is None:
             all_genes = set()
@@ -122,6 +179,11 @@ class Reaction:
             self._genes_cache = frozenset(all_genes)
         return self._genes_cache
 
+    @property
+    def genes(self) -> FrozenSet[str]:
+        """Gene IDs associated with this reaction."""
+        return self.get_genes()
+
     def get_kos(self) -> Tuple[str, ...]:
         if self._kos_cache is None:
             self._kos_cache = tuple(self.ko_to_genes.keys())
@@ -129,11 +191,12 @@ class Reaction:
 
 
 # ----------------------------------------------------------------------
-# Pathway (now with organism reference and DataFrame method)
+# Pathway (now knows its compounds)
 # ----------------------------------------------------------------------
 class Pathway:
     __slots__ = ('id', 'title', 'description', 'dblinks',
-                 'gene_ids', 'reaction_ids', 'organism')
+                 '_gene_ids', '_reaction_ids', '_compound_ids',
+                 'organism')
 
     def __init__(self, pathway_id: str, gene_kos: Optional[Dict[str, Set[str]]] = None,
                  organism: Optional['Organism'] = None) -> None:
@@ -143,8 +206,9 @@ class Pathway:
         self.dblinks: Dict[str, str] = {}
         if gene_kos is None:
             gene_kos = {}
-        self.gene_ids: FrozenSet[str] = frozenset(gene_kos.keys())
-        self.reaction_ids: Union[Set[str], FrozenSet[str]] = set()
+        self._gene_ids: FrozenSet[str] = frozenset(gene_kos.keys())
+        self._reaction_ids: Union[Set[str], FrozenSet[str]] = set()
+        self._compound_ids: Optional[FrozenSet[str]] = None
         self.organism: Optional['Organism'] = organism
 
     def __setstate__(self, state):
@@ -161,15 +225,50 @@ class Pathway:
         if not hasattr(self, 'organism'):
             self.organism = None
 
+    @property
+    def gene_ids(self) -> FrozenSet[str]:
+        return self._gene_ids
+
+    @gene_ids.setter
+    def gene_ids(self, value):
+        self._gene_ids = frozenset(value)
+
+    @property
+    def reaction_ids(self) -> FrozenSet[str]:
+        return frozenset(self._reaction_ids) if not isinstance(self._reaction_ids, frozenset) else self._reaction_ids
+
     def add_reactions(self, reaction_ids: Union[str, Set[str]]) -> None:
         if isinstance(reaction_ids, str):
-            self.reaction_ids.add(reaction_ids)
+            self._reaction_ids.add(reaction_ids)
         else:
-            self.reaction_ids.update(reaction_ids)
+            self._reaction_ids.update(reaction_ids)
+
+    @property
+    def compounds(self) -> FrozenSet[str]:
+        """Compound IDs present in this pathway (union of all reaction compounds)."""
+        if self._compound_ids is None:
+            if self.organism is None:
+                return frozenset()
+            # compute lazily
+            cids = set()
+            for rxn_id in self.reaction_ids:
+                rxn = self.organism.reactions.get(rxn_id)
+                if rxn:
+                    cids.update(rxn.substrates | rxn.products)
+            self._compound_ids = frozenset(cids)
+        return self._compound_ids
+
+    @compounds.setter
+    def compounds(self, value):
+        """Allow setting (used by Organism.finalize)."""
+        self._compound_ids = frozenset(value)
 
     def __repr__(self) -> str:
         return f"Pathway({self.id}, {len(self.gene_ids)} genes, {len(self.reaction_ids)} reactions)"
 
+    # ------------------------------------------------------------------
+    # DataFrame helper (updated with clean compound IDs)
+    # ------------------------------------------------------------------
     def get_reactions_df(self, other_pathways: bool = True, include_genes: bool = True):
         if self.organism is None:
             raise RuntimeError(
@@ -187,7 +286,7 @@ class Pathway:
             if rxn is None:
                 continue
 
-            genes = self.organism.get_genes_for_reaction(rxn_id) if include_genes else frozenset()
+            genes = rxn.genes if include_genes else frozenset()
             gene_str = ", ".join(sorted(genes)) if genes else ""
 
             if not other_pathways:
@@ -227,7 +326,6 @@ class Pathway:
         df = pd.DataFrame(rows)
 
         if other_pathways and not df.empty:
-            # Columns that are lists → convert to tuples for grouping
             list_cols = ['Substrates_kegg', 'Substrates_read', 'Products_kegg', 'Products_read']
             for col in list_cols:
                 if col in df.columns:
@@ -239,12 +337,10 @@ class Pathway:
                   .agg(lambda pws: ', '.join(sorted(pws)))
             )
 
-            # Convert tuple columns back to lists
             for col in list_cols:
                 if col in df.columns:
                     df[col] = df[col].apply(list)
 
-            # Reorder columns so Pathway comes early
             first_cols = ['Reaction', 'Pathway']
             other_cols = [c for c in df.columns if c not in first_cols]
             df = df[first_cols + other_cols]
@@ -253,7 +349,7 @@ class Pathway:
 
 
 # ----------------------------------------------------------------------
-# KGML fetcher
+# KGML fetcher (unchanged)
 # ----------------------------------------------------------------------
 def get_pathway_kgml(pathway_id: str, cache_dir: str = "kegg_cache"):
     os.makedirs(cache_dir, exist_ok=True)
@@ -288,7 +384,7 @@ def get_pathway_kgml(pathway_id: str, cache_dir: str = "kegg_cache"):
 
 
 # ----------------------------------------------------------------------
-# Organism (full, with load_pathway passing organism=self)
+# Organism (now builds full linkage during finalize)
 # ----------------------------------------------------------------------
 class Organism:
     def __init__(self, org_code: str, batch_size: int = 10, cache_dir: str = "kegg_cache"):
@@ -302,10 +398,10 @@ class Organism:
         self._pathway_reaction_map: Dict[str, Set[str]] = defaultdict(set)
         self._gene_pathway_map: Dict[str, Set[str]] = defaultdict(set)
 
-        self._ko_to_reactions: Dict[str, FrozenSet[str]] = {}
         self._ko_to_genes: Dict[str, FrozenSet[str]] = {}
-        self._reaction_to_kos: Dict[str, FrozenSet[str]] = {}
         self._gene_to_kos: Dict[str, FrozenSet[str]] = {}
+        self._ko_to_reactions: Dict[str, FrozenSet[str]] = {}
+        self._reaction_to_kos: Dict[str, FrozenSet[str]] = {}
 
         self._compounds: Dict[str, Compound] = {}
         self._compound_cache_file = os.path.join(cache_dir, f"{org_code}_compounds.json")
@@ -318,7 +414,7 @@ class Organism:
         self._freeze_mappings()
 
     # ------------------------------------------------------------------
-    # Caching helper
+    # Caching helper (unchanged)
     # ------------------------------------------------------------------
     def _cache_get(self, key: str, subdir: str = "", fetcher_func=None, *args, **kwargs) -> str:
         cache_subdir = os.path.join(self.cache_dir, subdir)
@@ -335,7 +431,7 @@ class Organism:
         return raw_data
 
     # ------------------------------------------------------------------
-    # KO–gene mapping
+    # KO–gene mapping (unchanged)
     # ------------------------------------------------------------------
     def _load_all_ko_genes(self) -> None:
         json_file = os.path.join(self.cache_dir, f"{self.org_code}_ko_genes.json")
@@ -369,7 +465,7 @@ class Organism:
         self._gene_to_kos = {gene: frozenset(kos) for gene, kos in self._gene_to_kos.items()}
 
     # ------------------------------------------------------------------
-    # KO–reaction mapping
+    # KO–reaction mapping (unchanged)
     # ------------------------------------------------------------------
     def _prefetch_all_ko_reactions(self) -> None:
         all_kos = list(self._ko_to_genes.keys())
@@ -439,7 +535,7 @@ class Organism:
                     ko_to_reactions_dict[ko].add(rn_id)
 
     # ------------------------------------------------------------------
-    # Internal freezing
+    # Internal freezing (unchanged)
     # ------------------------------------------------------------------
     def _freeze_mappings(self) -> None:
         self._ko_to_genes = {k: frozenset(v) for k, v in self._ko_to_genes.items()}
@@ -448,7 +544,7 @@ class Organism:
         self._reaction_to_kos = {k: frozenset(v) for k, v in self._reaction_to_kos.items()}
 
     # ------------------------------------------------------------------
-    # Compound management
+    # Compound management (enhanced with bigg_id)
     # ------------------------------------------------------------------
     def _load_compounds(self) -> None:
         if os.path.exists(self._compound_cache_file):
@@ -459,22 +555,30 @@ class Organism:
                 comp.name = info.get("name")
                 comp.formula = info.get("formula")
                 comp.mass = info.get("mass")
+                comp.bigg_id = info.get("bigg_id")
                 self._compounds[cid] = comp
 
     def _save_compounds(self) -> None:
         data = {}
         for cid, comp in self._compounds.items():
             if comp.name:
-                data[cid] = {"name": comp.name, "formula": comp.formula, "mass": comp.mass}
+                data[cid] = {
+                    "name": comp.name,
+                    "formula": comp.formula,
+                    "mass": comp.mass,
+                    "bigg_id": comp.bigg_id
+                }
         with open(self._compound_cache_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
 
     def get_compound(self, compound_id: str, fetch_if_missing: bool = True) -> Compound:
-        if compound_id not in self._compounds:
-            self._compounds[compound_id] = Compound(compound_id, self)
+        # Ensure bare ID (strip cpd: if accidentally given)
+        cid = compound_id.split(':')[-1] if ':' in compound_id else compound_id
+        if cid not in self._compounds:
+            self._compounds[cid] = Compound(cid, self)
             if fetch_if_missing:
-                self._fetch_compound_details(compound_id)
-        return self._compounds[compound_id]
+                self._fetch_compound_details(cid)
+        return self._compounds[cid]
 
     def _fetch_compound_details(self, compound_id: str) -> None:
         comp = self._compounds.get(compound_id)
@@ -536,9 +640,6 @@ class Organism:
     def get_kos_for_gene(self, locus_tag: str) -> FrozenSet[str]:
         return self._gene_to_kos.get(locus_tag, frozenset())
 
-    # ------------------------------------------------------------------
-    # Gene ↔ reaction ↔ compound walkers
-    # ------------------------------------------------------------------
     def get_reactions_for_gene(self, locus_tag: str) -> FrozenSet[str]:
         reactions = set()
         for ko in self.get_kos_for_gene(locus_tag):
@@ -549,22 +650,16 @@ class Organism:
         rxn = self.reactions.get(reaction_id)
         if not rxn:
             return frozenset()
-        compounds = set()
-        for pw_data in rxn.formula_per_pathway.values():
-            for s in pw_data.get('substrates', []):
-                compounds.add(s.split(':')[-1])
-            for p in pw_data.get('products', []):
-                compounds.add(p.split(':')[-1])
-        return frozenset(compounds)
+        return rxn.substrates | rxn.products
 
     def get_genes_for_reaction(self, reaction_id: str) -> FrozenSet[str]:
         rxn = self.reactions.get(reaction_id)
         if rxn:
-            return rxn.get_genes()
+            return rxn.genes
         return frozenset()
 
     # ------------------------------------------------------------------
-    # Pathway loading (modified to pass organism=self)
+    # Pathway loading (modified to strip cpd: prefix and collect compound IDs)
     # ------------------------------------------------------------------
     def _parse_gene_kos_from_text(self, flat_text: str) -> Dict[str, Set[str]]:
         gene_kos = {}
@@ -607,7 +702,7 @@ class Organism:
                 f.write(flat_text)
 
         gene_kos = self._parse_gene_kos_from_text(flat_text)
-        pw = Pathway(pathway_id, gene_kos, organism=self)      # <-- pass self
+        pw = Pathway(pathway_id, gene_kos, organism=self)
         self.pathways[pathway_id] = pw
 
         # ---------- Parse additional metadata ----------
@@ -676,34 +771,35 @@ class Organism:
                     self.reactions[rxn_id] = Reaction(rxn_id, self)
                 rxn_obj = self.reactions[rxn_id]
 
-                substrates_kegg = [s.name for s in kgml_rxn.substrates]
-                products_kegg   = [p.name for p in kgml_rxn.products]
+                # --- Store bare compound IDs (strip 'cpd:' prefix) ---
+                substrates_kegg = [s.name.split(':')[-1] for s in kgml_rxn.substrates]
+                products_kegg   = [p.name.split(':')[-1] for p in kgml_rxn.products]
 
-                subs_short = [s.split(':')[-1] for s in substrates_kegg]
-                prod_short = [p.split(':')[-1] for p in products_kegg]
+                # Update reaction's compound sets
+                rxn_obj._substrate_ids.update(substrates_kegg)
+                rxn_obj._product_ids.update(products_kegg)
+
+                subs_short = substrates_kegg   # already bare
+                prod_short = products_kegg
                 arrow = ' <=> ' if kgml_rxn.type == 'reversible' else ' --> '
 
                 formula_kegg = ' + '.join(subs_short) + arrow + ' + '.join(prod_short) if (subs_short or prod_short) else ''
 
                 substrates_read = []
-                for s in substrates_kegg:
-                    cid = s.split(':')[-1]
+                for cid in substrates_kegg:
                     comp = self.get_compound(cid, fetch_if_missing=False)
                     substrates_read.append(comp.name if comp.name else cid)
-                    comp.reactions.add(rxn_id)
 
                 products_read = []
-                for p in products_kegg:
-                    cid = p.split(':')[-1]
+                for cid in products_kegg:
                     comp = self.get_compound(cid, fetch_if_missing=False)
                     products_read.append(comp.name if comp.name else cid)
-                    comp.reactions.add(rxn_id)
 
                 formula_read = ' + '.join(substrates_read) + arrow + ' + '.join(products_read)
 
                 rxn_obj.formula_per_pathway[pathway_id] = {
                     'type': kgml_rxn.type,
-                    'substrates': substrates_kegg,
+                    'substrates': substrates_kegg,        # bare IDs
                     'products': products_kegg,
                     'substrates_read': substrates_read,
                     'products_read': products_read,
@@ -713,7 +809,8 @@ class Organism:
 
                 pw.reaction_ids.add(rxn_id)
 
-        pw.reaction_ids = frozenset(pw.reaction_ids)
+        # Freeze reaction_ids
+        pw.reaction_ids = frozenset(pw.reaction_ids) if not isinstance(pw.reaction_ids, frozenset) else pw.reaction_ids
 
         for rn_id in pw.reaction_ids:
             self._pathway_reaction_map[rn_id].add(pathway_id)
@@ -723,7 +820,7 @@ class Organism:
         return pw
 
     # ------------------------------------------------------------------
-    # Load all cached pathways
+    # Load all cached pathways (unchanged except now calls finalize)
     # ------------------------------------------------------------------
     def load_all_cached_pathways(self) -> list:
         pathways_dir = os.path.join(self.cache_dir, "pathways")
@@ -747,19 +844,56 @@ class Organism:
         return loaded
 
     # ------------------------------------------------------------------
-    # Finalize
+    # Finalize – builds all cross‑references
     # ------------------------------------------------------------------
     def finalize(self) -> None:
         if self._is_finalized:
             return
-        for comp in self._compounds.values():
-            if isinstance(comp.reactions, set):
-                comp.reactions = frozenset(comp.reactions)
+
+        logger.info("Building compound–reaction–gene–pathway links...")
+
+        # 1. Freeze reaction substrate/product sets
+        for rxn in self.reactions.values():
+            rxn._substrate_ids = frozenset(rxn._substrate_ids)
+            rxn._product_ids = frozenset(rxn._product_ids)
+
+        # 2. Build compound → reactions index
+        compound_to_reactions = defaultdict(set)
+        for rxn_id, rxn in self.reactions.items():
+            for cid in rxn.substrates | rxn.products:
+                compound_to_reactions[cid].add(rxn_id)
+
+        # 3. Assign reaction_ids, pathway_ids, gene_ids to each compound
+        for cid, comp in self._compounds.items():
+            rxn_set = compound_to_reactions.get(cid, set())
+            comp._reaction_ids = frozenset(rxn_set)
+            # pathway_ids = union of all pathways for those reactions
+            pw_set = set()
+            gene_set = set()
+            for rxn_id in rxn_set:
+                pw_set.update(self._pathway_reaction_map.get(rxn_id, set()))
+                gene_set.update(self.reactions[rxn_id].genes)
+            comp._pathway_ids = frozenset(pw_set)
+            comp._gene_ids = frozenset(gene_set)
+
+        # 4. Assign pathway_ids to each reaction
+        for rxn_id, rxn in self.reactions.items():
+            rxn._pathway_ids = frozenset(self._pathway_reaction_map.get(rxn_id, set()))
+
+        # 5. Assign compound_ids to each pathway
+        for pw in self.pathways.values():
+            cids = set()
+            for rxn_id in pw.reaction_ids:
+                rxn = self.reactions.get(rxn_id)
+                if rxn:
+                    cids.update(rxn.substrates | rxn.products)
+            pw._compound_ids = frozenset(cids)
+
         self._is_finalized = True
-        logger.debug("Organism finalized – compound reactions frozen.")
+        logger.debug("Linkage finalization complete.")
 
     # ------------------------------------------------------------------
-    # Save / Load
+    # Save / Load (unchanged)
     # ------------------------------------------------------------------
     def save(self, filepath: str) -> None:
         data = {
@@ -785,11 +919,14 @@ class Organism:
         obj = data['organism']
         if not isinstance(obj, Organism):
             raise TypeError(f"File {filepath} does not contain a keggtangled Organism")
+        # After unpickling, ensure linkages are frozen (they should be, but just in case)
+        if not obj._is_finalized:
+            obj.finalize()
         logger.info(f"Organism loaded from {filepath}")
         return obj
 
     # ------------------------------------------------------------------
-    # Summary
+    # Summary (unchanged)
     # ------------------------------------------------------------------
     def summary(self) -> dict:
         return {
