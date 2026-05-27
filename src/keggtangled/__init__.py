@@ -162,7 +162,69 @@ class Pathway:
             self.reaction_ids.add(reaction_ids)
         else:
             self.reaction_ids.update(reaction_ids)
+# inside class Pathway:
 
+    def get_reactions_df(self, other_pathways: bool = False):
+        """
+        Build a pandas DataFrame of reactions in this pathway.
+
+        Parameters
+        ----------
+        other_pathways : bool
+            If False (default), only the reaction details for *this* pathway are shown.
+            If True, includes details for the same reactions in **all** pathways where
+            they appear, adding a 'Pathway' column to distinguish them.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns: Reaction, (Pathway), Type, Substrates_kegg, Substrates_read,
+                     Products_kegg, Products_read, Formula_read, Formula_kegg
+        """
+        import pandas as pd
+
+        rows = []
+        for rxn_id in sorted(self.reaction_ids):
+            rxn = self.organism.reactions.get(rxn_id)
+            if rxn is None:
+                continue
+
+            if not other_pathways:
+                info = rxn.formula_per_pathway.get(self.id)
+                if info:
+                    row = {
+                        'Reaction': rxn_id,
+                        'Type': info.get('type', ''),
+                        'Substrates_kegg': info.get('substrates', []),
+                        'Substrates_read': info.get('substrates_read', []),
+                        'Products_kegg': info.get('products', []),
+                        'Products_read': info.get('products_read', []),
+                        'Formula_read': info.get('formula_read', ''),
+                        'Formula_kegg': info.get('formula_kegg', '')
+                    }
+                else:
+                    # reaction exists but has no formula for this pathway (shouldn't happen)
+                    row = {col: '' for col in ['Reaction', 'Type', 'Substrates_kegg',
+                                                'Substrates_read', 'Products_kegg',
+                                                'Products_read', 'Formula_read', 'Formula_kegg']}
+                    row['Reaction'] = rxn_id
+                rows.append(row)
+            else:
+                for pw_id, info in rxn.formula_per_pathway.items():
+                    row = {
+                        'Reaction': rxn_id,
+                        'Pathway': pw_id,
+                        'Type': info.get('type', ''),
+                        'Substrates_kegg': info.get('substrates', []),
+                        'Substrates_read': info.get('substrates_read', []),
+                        'Products_kegg': info.get('products', []),
+                        'Products_read': info.get('products_read', []),
+                        'Formula_read': info.get('formula_read', ''),
+                        'Formula_kegg': info.get('formula_kegg', '')
+                    }
+                    rows.append(row)
+
+        return pd.DataFrame(rows)
     def __repr__(self) -> str:
         return f"Pathway({self.id}, {len(self.gene_ids)} genes, {len(self.reaction_ids)} reactions)"
 
