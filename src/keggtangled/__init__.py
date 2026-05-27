@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-keggtangled v0.6.0 – Fully linked KEGG metabolism library.
+keggtangled v0.6.1 – Fully linked KEGG metabolism library.
 
 Now every object "knows" about its neighbours:
 - Compound ↔ reactions, pathways, genes
