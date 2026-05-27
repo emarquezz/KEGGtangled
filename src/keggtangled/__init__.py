@@ -751,7 +751,8 @@ class Organism:
         for ko in all_kos:
             rxn_ids = self._ko_to_reactions.get(ko, frozenset())
             for rn_id in rxn_ids:
-                pw.reaction_ids.add(rn_id)
+                # ✅ use add_reactions() instead of .add()
+                pw.add_reactions(rn_id)
                 if rn_id not in self.reactions:
                     self.reactions[rn_id] = Reaction(rn_id, self)
 
@@ -807,10 +808,11 @@ class Organism:
                     'formula_read': formula_read
                 }
 
-                pw.reaction_ids.add(rxn_id)
+                # ✅ use add_reactions() again
+                pw.add_reactions(rxn_id)
 
-        # Freeze reaction_ids
-        pw.reaction_ids = frozenset(pw.reaction_ids) if not isinstance(pw.reaction_ids, frozenset) else pw.reaction_ids
+        # ✅ freeze directly on the private attribute
+        pw._reaction_ids = frozenset(pw._reaction_ids)
 
         for rn_id in pw.reaction_ids:
             self._pathway_reaction_map[rn_id].add(pathway_id)
